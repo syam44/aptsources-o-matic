@@ -1,0 +1,412 @@
+#!/bin/bash
+#
+# aptsources-o-matic
+# https://github.com/syam44/aptsources-o-matic
+#
+# Distributed under the GNU General Public License version 3
+# https://www.gnu.org/copyleft/gpl.html
+#
+# Authors: syam (aks92@free.fr)
+#
+# Description: Debian apt sources.list/preferences generator.
+#
+# TODO: i18n
+#
+
+
+# Couleurs
+COLOR_ERROR="\033[01;31m"     # Rouge vif
+COLOR_WARN="\033[01;33m"      # Jaune vif
+COLOR_QUESTION="\033[36m"     # Cyan sombre
+COLOR_IMPORTANT="\033[01;36m" # Cyan vif
+COLOR_NONE="\033[00m"
+# Expansion des codes d'échappement pour echo.
+shopt -s xpg_echo
+
+
+# Version
+echo "${COLOR_IMPORTANT}aptsources-o-matic${COLOR_NONE} version 0.0-devel"
+echo
+
+
+#
+# Déclaration des noms des différentes distributions
+#
+declare -A DISTRIBUTIONS
+DISTRIBUTIONS["stable"]="squeeze"
+DISTRIBUTIONS["testing"]="wheezy"
+
+
+#
+# Menu à choix unique
+#
+choice_radio()
+{
+  local _COUNT=1
+  local _OPTION
+  local _RESULT_VAR="$1"
+  echo "${COLOR_QUESTION}""$2""${COLOR_NONE}"
+  shift 2
+  local _PROMPT="Votre choix ? ["
+  for _OPTION in "$@"; do
+    echo "  $_COUNT) $_OPTION"
+    _PROMPT="$_PROMPT""$_COUNT/"
+    let _COUNT="$_COUNT + 1"
+  done
+  _PROMPT="${_PROMPT%/}] "
+  local _RESULT
+  while read -n 1 -p "$_PROMPT" _RESULT; do
+    [ "$_RESULT" != "" ] && echo
+    _COUNT=1
+    for _OPTION in "$@"; do
+      if [ "$_RESULT" = "$_COUNT" ]; then
+        eval $_RESULT_VAR=\"$_OPTION\"
+        return
+      else
+        let _COUNT="$_COUNT + 1"
+      fi
+    done
+    echo -n "Mauvaise option. "
+  done
+}
+
+
+#
+# Choix Oui / Non
+#
+choice_yesno()
+{
+  local _RESULT_VAR="$1"
+  shift
+  local _RESULT
+  while { echo -n "${COLOR_QUESTION}""$1""${COLOR_NONE}"; read -n 1 -p " [o/n] " _RESULT; }; do
+    [ "$_RESULT" != "" ] && echo
+    case "$_RESULT" in
+      o|O)
+        eval $_RESULT_VAR=\"true\"
+        return
+        ;;
+      n|N)
+        eval $_RESULT_VAR=\"false\"
+        return
+        ;;
+      *)
+        echo "Mauvaise option."
+        ;;
+    esac
+  done
+}
+
+
+configure_questions()
+{
+  #
+  # Choisir la distribution principale
+  #
+  local _DISTRIBUTIONS=()
+  _DISTRIBUTIONS+=("stable / «${DISTRIBUTIONS["stable"]}» ${COLOR_IMPORTANT}(recommandé)${COLOR_NONE}")
+  _DISTRIBUTIONS+=("testing / «${DISTRIBUTIONS["testing"]}»")
+  _DISTRIBUTIONS+=("unstable / «sid»")
+  choice_radio DISTRIBUTION "Quelle distribution principale souhaitez-vous utiliser ?" "${_DISTRIBUTIONS[@]}"
+  echo
+  #
+  if [ "$DISTRIBUTION" = "${_DISTRIBUTIONS[0]}" ]; then
+    DISTRIBUTION="stable"
+    APT_DISTRIBUTION="${DISTRIBUTIONS["stable"]}"
+    APT_DISTRIBUTION_NAMED="true"
+  elif [ "$DISTRIBUTION" = "${_DISTRIBUTIONS[1]}" ]; then
+    DISTRIBUTION="testing"
+    local _TESTING_ROLLING="Rolling-release «testing» ${COLOR_IMPORTANT}(recommandé)${COLOR_NONE}"
+    local _TESTING_NEXTSTABLE="Prochaine stable «${DISTRIBUTIONS["testing"]}»"
+    local _TESTING_TYPE
+    choice_radio _TESTING_TYPE "Comment souhaitez-vous utiliser «testing/${DISTRIBUTIONS["testing"]}» ?" "$_TESTING_ROLLING" "$_TESTING_NEXTSTABLE"
+    echo
+    if [ "$_TESTING_TYPE" = "$_TESTING_ROLLING" ]; then
+      APT_DISTRIBUTION="testing"
+      APT_DISTRIBUTION_NAMED="false"
+    else
+      APT_DISTRIBUTION="${DISTRIBUTIONS["testing"]}"
+      APT_DISTRIBUTION_NAMED="true"
+    fi
+  else
+    DISTRIBUTION="unstable"
+    APT_DISTRIBUTION="unstable"
+    APT_DISTRIBUTION_NAMED="false"
+  fi
+
+  #
+  # Valeurs par défaut
+  #
+  INCLUDE_STABLE="true"
+  INCLUDE_BACKPORTS="false"
+  INCLUDE_TESTING="true"
+  INCLUDE_UNSTABLE="true"
+  INCLUDE_EXPERIMENTAL="false"
+  REQUIRE_KEYRINGS="false"
+  INSTALL_KEYRINGS="false"
+  MULTIMEDIA_LOWPIN="true"
+
+  #
+  # Inclure d'autres dépôts officiels ?
+  #
+  if [ "$DISTRIBUTION" = "stable" ]; then
+    choice_yesno INCLUDE_BACKPORTS "Inclure les dépôts «backports» ? ${COLOR_IMPORTANT}(recommandé)"
+    choice_yesno INCLUDE_TESTING "Inclure les dépôts «testing» et «unstable» ?"
+    INCLUDE_UNSTABLE="$INCLUDE_TESTING"
+  fi
+  if [ "$INCLUDE_UNSTABLE" = "true" ]; then
+    choice_yesno INCLUDE_EXPERIMENTAL "Inclure les dépôts «experimental» ?"
+  fi
+
+  #
+  # Inclure debian-multimedia.org ?
+  #
+  choice_yesno INCLUDE_MULTIMEDIA "Inclure les dépôts NON-OFFICIELS «debian-multimedia.org» ? ${COLOR_IMPORTANT}(recommandé)"
+  if [ "$INCLUDE_MULTIMEDIA" = "true" ]; then
+    REQUIRE_KEYRINGS="true"
+    choice_yesno MULTIMEDIA_LOWPIN "Étiqueter les dépôts «debian-multimedia.org» à une priorité inférieure ? ${COLOR_IMPORTANT}(recommandé)"
+  fi
+
+  #
+  # Inclure contrib / non-free ?
+  #
+  choice_yesno INCLUDE_NONFREE "Inclure les logiciels propriétaires (sections «contrib» et «non-free») ? ${COLOR_IMPORTANT}(recommandé)"
+
+  #
+  # Inclure les sources ?
+  #
+  choice_yesno INCLUDE_SOURCES "Inclure les sources des paquets ? ${COLOR_NONE}(probablement inutile)"
+
+  #
+  # Inclure mozilla.debian.net / Iceweasel ?
+  #
+  echo
+  local _ICEWEASEL_TITLE="Quelle version d'Iceweasel (Firefox) voulez-vous utiliser (dépôts Debian ou «mozilla.debian.net») ?"
+  if [ "$DISTRIBUTION" = "stable" ]; then
+    local _ICEWEASEL_RELEASE="mozilla-release ${COLOR_IMPORTANT}(recommandé)${COLOR_NONE}"
+    local _ICEWEASEL_BETA="mozilla-beta"
+    local _ICEWEASEL_AURORA="mozilla-aurora"
+    local _ICEWEASEL_BACKPORT="mozilla-backport (3.6)"
+    local _ICEWEASEL_STABLE="debian-stable (3.5)"
+    choice_radio INCLUDE_ICEWEASEL "$_ICEWEASEL_TITLE" "$_ICEWEASEL_RELEASE" "$_ICEWEASEL_BETA" "$_ICEWEASEL_AURORA" "$_ICEWEASEL_BACKPORT" "$_ICEWEASEL_STABLE"
+  else
+    local _ICEWEASEL_RELEASE="debian-release ${COLOR_IMPORTANT}(recommandé)${COLOR_NONE}"
+    local _ICEWEASEL_BETA="debian-beta / experimental"
+    local _ICEWEASEL_AURORA="mozilla-aurora"
+    choice_radio INCLUDE_ICEWEASEL "$_ICEWEASEL_TITLE" "$_ICEWEASEL_RELEASE" "$_ICEWEASEL_BETA" "$_ICEWEASEL_AURORA"
+  fi
+  INCLUDE_ICEWEASEL_SOURCE="${INCLUDE_ICEWEASEL%-*}"
+  INCLUDE_ICEWEASEL="${INCLUDE_ICEWEASEL#*-}"
+  INCLUDE_ICEWEASEL="${INCLUDE_ICEWEASEL%% *}"
+  if [ "$DISTRIBUTION" = "stable" ]; then
+    if [ "$INCLUDE_ICEWEASEL" != "stable" ] && [ "$INCLUDE_ICEWEASEL" != "backport" ] && [ "$INCLUDE_BACKPORTS" = "false" ]; then
+      echo "Les dépôts «backports» ont été automatiquement rajoutés pour satisfaire les dépendances."
+      INCLUDE_BACKPORTS="true"
+    fi
+  elif [ "$INCLUDE_ICEWEASEL" = "beta" ] && [ "$INCLUDE_EXPERIMENTAL" = "false" ]; then
+    echo "Les dépôts «experimental» ont été automatiquement rajoutés pour satisfaire les dépendances."
+    INCLUDE_EXPERIMENTAL="true"
+  fi
+  if [ "$INCLUDE_ICEWEASEL_SOURCE" != "debian" ]; then
+    REQUIRE_KEYRINGS="true"
+  fi
+  echo
+
+  #
+  # Installer les keyrings GPG ?
+  #
+  if [ "$REQUIRE_KEYRINGS" = "true" ]; then
+    choice_yesno INSTALL_KEYRINGS "Installer automatiquement les clés de signature des dépôts ? ${COLOR_IMPORTANT}(recommandé)"
+    echo
+  fi
+}
+
+
+#
+# Poser les questions de configuration
+# TODO: accepter des arguments en ligne de commande
+#
+configure_questions
+
+
+#
+# Priorités de pinning
+#
+declare -A PRIORITIES
+PRIORITIES["$DISTRIBUTION"]=992
+if [ "$DISTRIBUTION" = "stable" ]; then
+  PRIORITIES["testing"]=502
+  PRIORITIES["unstable"]=102
+elif [ "$DISTRIBUTION" = "testing" ]; then
+  PRIORITIES["stable"]=502
+  PRIORITIES["unstable"]=102
+else
+  PRIORITIES["mm-unstable"]=101
+fi
+# Experimental : mozilla prioritaire sur debian
+PRIORITIES["mozilla-experimental"]=3
+PRIORITIES["experimental"]=2
+# Dépôts multimedia : placer en retrait si nécessaire
+for _REPOSITORY in ${!PRIORITIES[@]}; do
+  if [ "${PRIORITIES["mm-$_REPOSITORY"]}" = "" ]; then
+    if [ "$MULTIMEDIA_LOWPIN" = "true" ]; then
+      let _PRIORITY="${PRIORITIES["$_REPOSITORY"]} - 1"
+    else
+      _PRIORITY="${PRIORITIES["$_REPOSITORY"]}"
+    fi
+    PRIORITIES["mm-$_REPOSITORY"]="$_PRIORITY"
+  fi
+done
+# Backports
+PRIORITIES["backports"]=100
+
+
+#
+# Dépôts utilisés
+#
+REPOSITORIES=""
+HAS_PINNING="false"
+add_repository()
+{
+  # add_repository REPOSITORY [PRIORITY]
+
+  if [ "$REPOSITORIES" != "" ]; then
+    REPOSITORIES="$REPOSITORIES\n"
+  fi
+
+  local _PRIORITY=""
+  if [ "$2" != "" ]; then
+    _PRIORITY=" (${PRIORITIES["$2"]})"
+    HAS_PINNING="true"
+  fi
+  REPOSITORIES="${REPOSITORIES}""$1""$_PRIORITY"
+}
+
+
+if [ "$DISTRIBUTION" = "stable" ]; then
+  add_repository "debian/$APT_DISTRIBUTION" "stable"
+  add_repository "debian/$APT_DISTRIBUTION-security" "stable"
+  add_repository "debian/$APT_DISTRIBUTION-updates" "stable"
+  [ "$INCLUDE_MULTIMEDIA" = "true" ] && add_repository "multimedia/$APT_DISTRIBUTION" "mm-stable"
+  if [ "$INCLUDE_UNSTABLE" = "true" ]; then
+    add_repository "debian/${DISTRIBUTIONS["testing"]}" "testing"
+    add_repository "debian/${DISTRIBUTIONS["testing"]}-security" "testing"
+    [ "$INCLUDE_MULTIMEDIA" = "true" ] && add_repository "multimedia/${DISTRIBUTIONS["testing"]}" "mm-testing"
+    add_repository "debian/unstable" "unstable"
+    [ "$INCLUDE_MULTIMEDIA" = "true" ] && add_repository "multimedia/unstable" "mm-unstable"
+  fi
+  if [ "$INCLUDE_BACKPORTS" = "true" ]; then
+    add_repository "debian/$APT_DISTRIBUTION-backports" "backports"
+  fi
+  case "$INCLUDE_ICEWEASEL" in
+    backport)
+      add_repository "mozilla/$APT_DISTRIBUTION-backports/iceweasel-3.6" "backports"
+      echo "${COLOR_WARN}Pour installer Iceweasel :${COLOR_NONE} apt-get install -t squeeze-backports iceweasel\n"
+      ;;
+    release)
+      add_repository "mozilla/$APT_DISTRIBUTION-backports/iceweasel-release" "backports"
+      echo "${COLOR_WARN}Pour installer Iceweasel :${COLOR_NONE} apt-get install -t squeeze-backports iceweasel\n"
+      ;;
+    beta)
+      add_repository "mozilla/$APT_DISTRIBUTION-backports/iceweasel-beta" "mozilla-experimental"
+      echo "${COLOR_WARN}Pour installer Iceweasel :${COLOR_NONE} apt-get install -t squeeze-backports iceweasel\n"
+      ;;
+    aurora)
+      add_repository "mozilla/$APT_DISTRIBUTION-backports/iceweasel-aurora" "mozilla-experimental"
+      echo "${COLOR_WARN}Pour installer Iceweasel :${COLOR_NONE} apt-get install -t squeeze-backports iceweasel\n"
+      ;;
+  esac
+  if [ "$INCLUDE_EXPERIMENTAL" = "true" ]; then
+    add_repository "debian/experimental" "experimental"
+    [ "$INCLUDE_MULTIMEDIA" = "true" ] && add_repository "multimedia/experimental" "mm-experimental"
+  fi
+elif [ "$DISTRIBUTION" = "testing" ]; then
+  add_repository "debian/$APT_DISTRIBUTION" "testing"
+  add_repository "debian/$APT_DISTRIBUTION-security" "testing"
+  if [ "$APT_DISTRIBUTION_NAMED" = "true" ]; then
+    _STABLE_DISTRIBUTION="${DISTRIBUTIONS["stable"]}"
+  else
+    _STABLE_DISTRIBUTION="stable"
+  fi
+  add_repository "debian/$_STABLE_DISTRIBUTION-security" "testing"
+  add_repository "debian/$_STABLE_DISTRIBUTION-updates" "testing"
+  [ "$INCLUDE_MULTIMEDIA" = "true" ] && add_repository "multimedia/$APT_DISTRIBUTION" "mm-testing"
+  add_repository "debian/$_STABLE_DISTRIBUTION" "stable"
+  [ "$INCLUDE_MULTIMEDIA" = "true" ] && add_repository "multimedia/$_STABLE_DISTRIBUTION" "mm-stable"
+  add_repository "debian/unstable" "unstable"
+  [ "$INCLUDE_MULTIMEDIA" = "true" ] && add_repository "multimedia/unstable" "mm-unstable"
+  case "$INCLUDE_ICEWEASEL" in
+    beta)
+      echo "${COLOR_WARN}Pour installer Iceweasel :${COLOR_NONE} apt-get install -t experimental iceweasel\n"
+      ;;
+    aurora)
+      add_repository "mozilla/experimental/iceweasel-aurora" "mozilla-experimental"
+      echo "${COLOR_WARN}Pour installer Iceweasel :${COLOR_NONE} apt-get install -t experimental iceweasel\n"
+      ;;
+  esac
+  if [ "$INCLUDE_EXPERIMENTAL" = "true" ]; then
+    add_repository "debian/experimental" "experimental"
+    [ "$INCLUDE_MULTIMEDIA" = "true" ] && add_repository "multimedia/experimental" "mm-experimental"
+  fi
+else # unstable
+  # pinning pour placer debian-multimedia en retrait
+  if [ "$MULTIMEDIA_LOWPIN" = "true" ]; then
+    _PINNING_MM_UNSTABLE="mm-unstable"
+  else
+    _PINNING_MM_UNSTABLE=""
+  fi
+  add_repository "debian/unstable"
+  add_repository "debian/testing"
+  add_repository "debian/testing-security"
+  add_repository "debian/stable"
+  add_repository "debian/stable-security"
+  add_repository "debian/stable-updates"
+  [ "$INCLUDE_MULTIMEDIA" = "true" ] && add_repository "multimedia/unstable" "$_PINNING_MM_UNSTABLE"
+  [ "$INCLUDE_MULTIMEDIA" = "true" ] && add_repository "multimedia/testing" "$_PINNING_MM_UNSTABLE"
+  [ "$INCLUDE_MULTIMEDIA" = "true" ] && add_repository "multimedia/stable" "$_PINNING_MM_UNSTABLE"
+  case "$INCLUDE_ICEWEASEL" in
+    beta)
+      echo "${COLOR_WARN}Pour installer Iceweasel :${COLOR_NONE} apt-get install -t experimental iceweasel\n"
+      ;;
+    aurora)
+      add_repository "mozilla/experimental/iceweasel-aurora" "mozilla-experimental"
+      echo "${COLOR_WARN}Pour installer Iceweasel :${COLOR_NONE} apt-get install -t experimental iceweasel\n"
+      ;;
+  esac
+  if [ "$INCLUDE_EXPERIMENTAL" = "true" ]; then
+    add_repository "debian/experimental"
+    [ "$INCLUDE_MULTIMEDIA" = "true" ] && add_repository "multimedia/experimental"
+  fi
+fi
+
+
+echo "${COLOR_WARN}Dépôts actifs :${COLOR_NONE}"
+if [ "$HAS_PINNING" = "false" ]; then
+  echo "Note : aucun fichier «preferences» n'est nécessaire."
+elif [ "$DISTRIBUTION" = "unstable" ]; then
+  echo "Note : les dépôts sans étiquetage utilisent leurs priorités par défaut."
+fi
+echo "$REPOSITORIES" | sed 's@^@    @g'
+
+echo
+echo -n "${COLOR_WARN}Sections :${COLOR_NONE} main"
+[ "$INCLUDE_NONFREE" = "true" ] && echo -n " contrib non-free"
+[ "$INCLUDE_SOURCES" = "true" ] && echo -n " sources"
+echo
+
+echo
+echo "${COLOR_WARN}Variables brutes :${COLOR_NONE}"
+echo "    DISTRIBUTION            = $DISTRIBUTION"
+echo "    APT_DISTRIBUTION        = $APT_DISTRIBUTION"
+echo "    APT_DISTRIBUTION_NAMED  = $APT_DISTRIBUTION_NAMED"
+echo "    INCLUDE_STABLE          = $INCLUDE_STABLE"
+echo "    INCLUDE_BACKPORTS       = $INCLUDE_BACKPORTS"
+echo "    INCLUDE_TESTING         = $INCLUDE_TESTING"
+echo "    INCLUDE_UNSTABLE        = $INCLUDE_UNSTABLE"
+echo "    INCLUDE_EXPERIMENTAL    = $INCLUDE_EXPERIMENTAL"
+echo "    INCLUDE_MULTIMEDIA      = $INCLUDE_MULTIMEDIA"
+echo "    MULTIMEDIA_LOWPIN       = $MULTIMEDIA_LOWPIN"
+echo "    INCLUDE_NONFREE         = $INCLUDE_NONFREE"
+echo "    INCLUDE_SOURCES         = $INCLUDE_SOURCES"
+echo "    INSTALL_KEYRINGS        = $INSTALL_KEYRINGS"
+echo "    INCLUDE_ICEWEASEL       = $INCLUDE_ICEWEASEL_SOURCE/$INCLUDE_ICEWEASEL"

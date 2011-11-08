@@ -1,0 +1,4 @@
+Note: the following dependencies are expressed as Debian package names.
+
+Depends:
+    bash >= 4.0
